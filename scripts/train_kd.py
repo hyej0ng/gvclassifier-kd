@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Knowledge Distillation training script.
+Teacher: 100M MistralForSequenceClassification (fold1 checkpoint)
+Student: ~50M smaller Mistral, randomly initialized from modified config
+
+conda activate GO
+CUDA_VISIBLE_DEVICES=0 python compression/scripts/train_kd.py \
+    --work_dir /mnt/taskmaster1/scratch/hyejong/01_gv_genomeocean_5fold/finetuning_go_main
+"""
+
+'''
+cd /mnt/taskmaster1/scratch/hyejong/01_gv_genomeocean_5fold/finetuning_go_main/compression/scripts
+CUDA_VISIBLE_DEVICES=0 python train_kd.py
+로 실행함
+'''
+
+import os, sys, json, time, argparse, datetime, inspect, math, warnings
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+    DataCollatorWithPadding,
+    TrainerCallback,
+)
+from transformers.trainer_utils import get_last_checkpoint
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    from huggingface_hub.utils import disable_progress_bars
+    disable_progress_bars()
+except Exception:
+    pass
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"The attention mask API under `transformers\.modeling_attn_mask_utils`.*",
+    category=FutureWarning,
+)
+
+# ----------------------------------------------------------------------
+# Transformers cache compatibility patch
+# ----------------------------------------------------------------------
+try:
+    from transformers.cache_utils import DynamicCache
+
+    if not hasattr(DynamicCache, "from_legacy_cache"):
+        @classmethod
+        def _from_legacy_cache(cls, past_key_values=None):
+            # transformers 5.x compatibility fallback
+            if past_key_values is None:
+                return cls()
+
+            cache = cls()
+            for layer_idx, layer_past in enumerate(past_key_values):
+                if layer_past is None:
+                    continue
+
+                # expected legacy format: (key_states, value_states, ...)
+                if isinstance(layer_past, (list, tuple)) and len(layer_past) >= 2:
+                    key_states, value_states = layer_past[0], layer_past[1]
+                    cache.update(key_states, value_states, layer_idx)
+
+            return cache
+
+        DynamicCache.from_legacy_cache = _from_legacy_cache
+        print("[INFO] Applied DynamicCache.from_legacy_cache compatibility patch")
+
+except Exception as e:
+    print(f"[WARN] DynamicCache compatibility patch skipped: {e}")
+
+LABEL_NAMES = {0: "Cellular", 1: "NCLDV", 2: "Phage"}
+
+# =============================================================================
+# Logging utilities
+# =============================================================================
+
+class Tee:
+    """Duplicate stdout/stderr to a .txt file."""
+    def __init__(self, fpath):
+        self.file = open(fpath, "a", buffering=1)
+        self._stdout = sys.stdout
+        self._stderr = sys.stderr
+        sys.stdout = self
+        sys.stderr = self
+        self._last_pb_write = 0.0
+        self._pb_interval_sec = 60.0
+
+    def write(self, s):
+        try:
+            self._stdout.write(s)
+            self._stdout.flush()
+        except Exception:
+            pass
+        try:
+            now = time.time()
+            is_progress_update = ("\r" in s) and ("\n" not in s)
+            if is_progress_update and (now - self._last_pb_write) < self._pb_interval_sec:
+                return
+            if is_progress_update:
+                self._last_pb_write = now
+            self.file.write(s)
+            self.file.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try: self._stdout.flush()
+        except Exception: pass
+        try: self.file.flush()
+        except Exception: pass
+
+    def isatty(self):
+        try: return self._stdout.isatty()
+        except Exception: return False
+
+    def close(self):
+        sys.stdout = self._stdout
+        sys.stderr = self._stderr
+        try: self.file.close()
+        except Exception: pass
+
+
+def _load_json(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+class RuntimeAccumulator:
+    def __init__(self, out_json_path, meta=None):
+        self.out_json_path = out_json_path
+        self.meta = meta or {}
+        self.t0 = None
+        self.rows_this = 0
+        self.bp_this = 0
+        self.seg_started_at = None
+
+    def start(self):
+        self.t0 = time.time()
+        self.seg_started_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def add_progress(self, rows_inc=0, bp_inc=0):
+        self.rows_this += int(rows_inc)
+        self.bp_this += int(bp_inc)
+
+    def finish(self, stats: dict):
+        t1 = time.time()
+        seg_seconds = max(0.0, t1 - (self.t0 or t1))
+        seg = {
+            "started_at": self.seg_started_at,
+            "finished_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "seconds": seg_seconds,
+            "rows": int(self.rows_this),
+            "approx_bp": int(self.bp_this),
+        }
+        for k, v in (stats or {}).items():
+            if v is not None:
+                seg[k] = int(v) if isinstance(v, (int, float)) else v
+
+        acc = _load_json(self.out_json_path)
+        if not acc:
+            acc = {"meta": self.meta, "segments": []}
+        acc.setdefault("segments", []).append(seg)
+
+        total_seconds = sum(s.get("seconds", 0.0) for s in acc["segments"])
+        total_rows = sum(s.get("rows", 0) for s in acc["segments"])
+        total_bp = sum(s.get("approx_bp", 0) for s in acc["segments"])
+
+        acc["total_seconds"] = total_seconds
+        acc["train_rows"] = total_rows
+        acc["approx_train_bp"] = total_bp
+        acc["sec_per_kb"] = (total_seconds / (total_bp / 1000.0)) if total_bp else None
+
+        def _seg_max(key):
+            vals = [s.get(key, 0) for s in acc["segments"] if s.get(key) is not None]
+            return int(max(vals)) if vals else 0
+
+        acc["vram_peak_reserved_bytes_max"] = _seg_max("vram_peak_reserved_bytes")
+        acc["vram_peak_allocated_bytes_max"] = _seg_max("vram_peak_allocated_bytes")
+
+        _save_json(self.out_json_path, acc)
+        return acc
+
+
+# =============================================================================
+# Loss curve callback
+# =============================================================================
+
+def _read_loss_csv(csv_path):
+    rows = []
+    if not os.path.exists(csv_path):
+        return rows
+    try:
+        with open(csv_path, "r") as f:
+            _ = f.readline()
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 7:
+                    continue
+                rows.append({
+                    "global_step": int(float(parts[0])),
+                    "epoch": float(parts[1]),
+                    "loss": float(parts[2]),
+                    "grad_norm": (None if parts[3] == "" else float(parts[3])),
+                    "learning_rate": (None if parts[4] == "" else float(parts[4])),
+                    "progress_pct": (None if parts[5] == "" else float(parts[5])),
+                    "ts": parts[6],
+                })
+    except Exception:
+        return rows
+    return rows
+
+
+def _write_loss_csv(csv_path, rows):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w") as f:
+        f.write("global_step,epoch,loss,grad_norm,learning_rate,progress_pct,ts\n")
+        for r in rows:
+            def fmt(x): return "" if x is None else str(x)
+            f.write(
+                f"{r['global_step']},{r['epoch']},{r['loss']},"
+                f"{fmt(r.get('grad_norm'))},{fmt(r.get('learning_rate'))},"
+                f"{fmt(r.get('progress_pct'))},{r['ts']}\n"
+            )
+
+
+def _plot_loss_png(png_path, rows):
+    if not rows:
+        return
+    rows_sorted = sorted(rows, key=lambda r: (r["epoch"], r["global_step"]))
+    xs = [r["epoch"] for r in rows_sorted]
+    ys = [r["loss"] for r in rows_sorted]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(xs, ys, marker="o", markersize=2)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title("KD Training loss")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(png_path), exist_ok=True)
+    fig.savefig(png_path, dpi=180)
+    plt.close(fig)
+
+
+class DinoStyleLogCallback(TrainerCallback):
+    def __init__(self, out_dir, plot_every_n_logs: int = 1):
+        self.out_dir = out_dir
+        self.csv_path = os.path.join(out_dir, "train_loss.csv")
+        self.png_path = os.path.join(out_dir, "train_loss.png")
+        self.rows = _read_loss_csv(self.csv_path)
+        self.by_step = {int(r["global_step"]): r for r in self.rows}
+        self.plot_every_n_logs = max(1, int(plot_every_n_logs))
+        self._log_counter = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        logs = logs or {}
+        if ("loss" not in logs) or ("epoch" not in logs):
+            return
+
+        gs = int(getattr(state, "global_step", 0))
+        max_steps = int(getattr(state, "max_steps", 0)) if getattr(state, "max_steps", None) else 0
+
+        ep = float(logs.get("epoch", 0.0))
+        loss = float(logs.get("loss", 0.0))
+        grad_norm = logs.get("grad_norm", None)
+        lr = logs.get("learning_rate", None)
+        progress_pct = (gs / max_steps * 100.0) if max_steps > 0 else None
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.by_step[gs] = {
+            "global_step": gs,
+            "epoch": ep,
+            "loss": loss,
+            "grad_norm": (None if grad_norm is None else float(grad_norm)),
+            "learning_rate": (None if lr is None else float(lr)),
+            "progress_pct": progress_pct,
+            "ts": ts,
+        }
+        self.rows = list(self.by_step.values())
+        _write_loss_csv(self.csv_path, self.rows)
+
+        step_str = f"{gs}/{max_steps}" if max_steps > 0 else f"{gs}/NA"
+        prog_str = f"{progress_pct:.1f}%" if progress_pct is not None else "NA%"
+        gn_str = f"{float(grad_norm):.4f}" if grad_norm is not None else "NA"
+        lr_str = f"{float(lr):.3e}" if lr is not None else "NA"
+        print(f"[LOG] {prog_str} | step {step_str} | epoch {ep:.2f} | loss {loss:.4f} | grad_norm {gn_str} | lr {lr_str}")
+
+        self._log_counter += 1
+        if (self._log_counter % self.plot_every_n_logs) == 0:
+            try:
+                _plot_loss_png(self.png_path, self.rows)
+            except Exception as e:
+                print(f"[WARN] Plotting failed (ignored): {e}")
+                try: plt.close("all")
+                except Exception: pass
+
+
+# =============================================================================
+# KD Trainer
+# =============================================================================
+
+class KDTrainer(Trainer):
+    """
+    Trainer subclass that computes KD loss:
+        loss = alpha * CE(student, hard_labels)
+             + (1 - alpha) * T^2 * KL(log_softmax(student/T) || softmax(teacher/T))
+    """
+
+    def __init__(self, teacher, alpha: float, temperature: float, **kwargs):
+        super().__init__(**kwargs)
+        self.teacher = teacher
+        self.alpha = alpha
+        self.temperature = temperature
+        self._first_batch_logged = False
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+
+        # Student forward
+        student_out = model(**inputs)
+        student_logits = student_out.logits  # (B, num_labels)
+
+        # Teacher forward (no gradient)
+        device = student_logits.device
+        if next(self.teacher.parameters()).device != device:
+            self.teacher = self.teacher.to(device)
+
+        with torch.no_grad():
+            teacher_out = self.teacher(**inputs)
+            teacher_logits = teacher_out.logits.to(student_logits.dtype)
+
+        # CE loss (hard labels)
+        ce_loss = F.cross_entropy(student_logits, labels)
+
+        # KL divergence loss (soft labels with temperature)
+        T = self.temperature
+        soft_student = F.log_softmax(student_logits / T, dim=-1)
+        soft_teacher = F.softmax(teacher_logits / T, dim=-1)
+        kl_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (T ** 2)
+
+        loss = self.alpha * ce_loss + (1.0 - self.alpha) * kl_loss
+
+        # Log component losses on first batch only
+        if not self._first_batch_logged:
+            print(f"[KD] First batch losses: CE={ce_loss.item():.4f}  KL={kl_loss.item():.4f}  Total={loss.item():.4f}")
+            self._first_batch_logged = True
+
+        return (loss, student_out) if return_outputs else loss
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def paths(work_dir: str, size_tag: str):
+    if size_tag.lower() == "5kb":
+        return os.path.join(work_dir, "data_5KB"), 1250
+    else:
+        return os.path.join(work_dir, "data_10KB"), 2500
+
+
+def load_train_split(fold_dir: str, ver: str):
+    train_csv = os.path.join(fold_dir, f"train_{ver}.csv")
+    if not os.path.exists(train_csv):
+        raise FileNotFoundError(f"Training CSV not found: {train_csv}")
+    ds = load_dataset("csv", data_files={"train": train_csv})
+    assert {"sequence", "label"}.issubset(ds["train"].column_names), \
+        "CSV must have 'sequence' and 'label' columns"
+    return ds
+
+
+def tokenize_dataset(ds, tok, max_len: int):
+    def _tok(batch):
+        return tok(batch["sequence"], truncation=True, max_length=max_len,
+                   return_token_type_ids=False)
+
+    x = ds["train"].map(
+        _tok, batched=True,
+        remove_columns=[c for c in ds["train"].column_names if c not in ("sequence", "label")]
+    )
+    if "token_type_ids" in x.column_names:
+        x = x.remove_columns("token_type_ids")
+    x = x.rename_column("label", "labels")
+    return x.with_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+
+def build_training_args(out_dir, num_train_epochs, per_device_train_batch_size,
+                        learning_rate, save_steps, grad_accum, logging_steps):
+    sig = inspect.signature(TrainingArguments.__init__)
+    base = dict(
+        output_dir=out_dir,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=per_device_train_batch_size,
+        learning_rate=learning_rate,
+        save_steps=save_steps,
+        save_total_limit=2,
+        gradient_accumulation_steps=grad_accum,
+        logging_steps=logging_steps,
+    )
+    if "logging_strategy" in sig.parameters:
+        base["logging_strategy"] = "steps"
+    if "disable_tqdm" in sig.parameters:
+        base["disable_tqdm"] = True
+    if "report_to" in sig.parameters:
+        base["report_to"] = []
+    if "remove_unused_columns" in sig.parameters:
+        base["remove_unused_columns"] = False
+    kwargs = {k: v for k, v in base.items() if k in sig.parameters}
+    if "bf16" in sig.parameters:
+        kwargs["bf16"] = True
+    return TrainingArguments(**kwargs)
+
+
+def print_param_summary(model, name="model"):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[{name}] total={total:,}  trainable={trainable:,}  frozen={total-trainable:,}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    ap = argparse.ArgumentParser(description="Knowledge Distillation: Teacher(100M) -> Student(~50M)")
+    ap.add_argument("--work_dir", default=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                    help="Root of finetuning_go_main directory")
+    ap.add_argument("--teacher_model_path", default=None,
+                    help="Path to teacher checkpoint (default: ft_models/train_v3_100M_5kb/fold1/checkpoint-326785)")
+    ap.add_argument("--student_tag", default="50M")
+    ap.add_argument("--data_version", default="v3")
+    ap.add_argument("--size_tag", default="5kb")
+
+    # Student architecture (matches 2026_03_25jeongik.py defaults, ~49.2M params)
+    ap.add_argument("--hidden_size", type=int, default=768)
+    ap.add_argument("--num_hidden_layers", type=int, default=6)
+    ap.add_argument("--num_attention_heads", type=int, default=8)
+    ap.add_argument("--num_key_value_heads", type=int, default=8)
+    ap.add_argument("--intermediate_size", type=int, default=2304)
+
+    # KD hyperparameters
+    ap.add_argument("--alpha", type=float, default=0.5,
+                    help="Weight for CE loss (1-alpha goes to KL loss)")
+    ap.add_argument("--temperature", type=float, default=4.0,
+                    help="Softmax temperature for distillation")
+
+    # Training hyperparameters
+    ap.add_argument("--num_train_epochs", type=int, default=5)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=8)
+    ap.add_argument("--learning_rate", type=float, default=3e-5)
+    ap.add_argument("--save_steps", type=int, default=2000)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    ap.add_argument("--log_every_fraction", type=float, default=0.1,
+                    help="Log every this fraction of an epoch (e.g. 0.1 => 10 logs/epoch)")
+    ap.add_argument("--plot_every_n_logs", type=int, default=1)
+
+    args = ap.parse_args()
+
+    # -----------------------------------------------------------------------
+    # Resolve paths
+    # -----------------------------------------------------------------------
+    data_root, max_len = paths(args.work_dir, args.size_tag)
+    fold_dir = os.path.join(data_root, "fold1")
+
+    if args.teacher_model_path is None:
+        args.teacher_model_path = os.path.join(
+            args.work_dir,
+            "ft_models/train_v3_100M_5kb/fold1/checkpoint-326785"
+        )
+
+    out_dir = os.path.join(
+        args.work_dir,
+        f"ft_models/kd_{args.data_version}_{args.student_tag}_{args.size_tag}/fold1"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+
+    log_root = os.path.join(args.work_dir, "log/train")
+    os.makedirs(log_root, exist_ok=True)
+
+    log_path = os.path.join(
+        log_root,
+        f"kd_{args.data_version}_{args.student_tag}_{args.size_tag}_fold1_{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"
+    )
+
+    tee = Tee(log_path)
+    print(f"[INFO] Logging to {log_path}")
+    print(f"[INFO] time_local: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f"[INFO] time_utc:   {datetime.datetime.utcnow():%Y-%m-%d %H:%M:%SZ}")
+    print(f"[INFO] teacher_model_path: {args.teacher_model_path}")
+    print(f"[INFO] output_dir:         {out_dir}")
+    print(f"[INFO] fold_dir:           {fold_dir}")
+    print(f"[INFO] alpha={args.alpha}  temperature={args.temperature}")
+
+    try:
+        # -------------------------------------------------------------------
+        # 1) Tokenizer (from teacher)
+        # -------------------------------------------------------------------
+        print("[INFO] Loading tokenizer from teacher checkpoint...")
+        tok = AutoTokenizer.from_pretrained(
+            args.teacher_model_path,
+            trust_remote_code=True,
+            model_max_length=max_len,
+            use_fast=True,
+            padding_side="right",
+        )
+        if tok.pad_token is None:
+            if tok.eos_token is not None:
+                tok.pad_token = tok.eos_token
+            else:
+                tok.add_special_tokens({"pad_token": "[PAD]"})
+
+        # -------------------------------------------------------------------
+        # 2) Teacher model (frozen)
+        # -------------------------------------------------------------------
+        teacher = AutoModelForSequenceClassification.from_pretrained(
+            args.teacher_model_path,
+            trust_remote_code=True,
+        )
+
+        if hasattr(teacher.config, "use_cache"):
+            teacher.config.use_cache = False
+
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+
+        # -------------------------------------------------------------------
+        # 3) Student model (randomly initialized from modified config)
+        # -------------------------------------------------------------------
+        print("[INFO] Building student model from modified config...")
+        config = AutoConfig.from_pretrained(
+            args.teacher_model_path,
+            trust_remote_code=True,
+        )
+        config.hidden_size = args.hidden_size
+        config.num_hidden_layers = args.num_hidden_layers
+        config.num_attention_heads = args.num_attention_heads
+        config.num_key_value_heads = args.num_key_value_heads
+        config.intermediate_size = args.intermediate_size
+        config.head_dim = args.hidden_size // args.num_attention_heads
+        config.max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        config.num_labels = len(LABEL_NAMES)
+        config.id2label = {i: LABEL_NAMES[i] for i in LABEL_NAMES}
+        config.label2id = {v: k for k, v in LABEL_NAMES.items()}
+        config.pad_token_id = tok.pad_token_id
+        config.use_cache = False
+
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size ({config.hidden_size}) must be divisible by "
+                f"num_attention_heads ({config.num_attention_heads})"
+            )
+
+        student = AutoModelForSequenceClassification.from_config(
+            config,
+            trust_remote_code=True,
+        )
+        print_param_summary(student, "student")
+
+        # Resize embeddings if tokenizer vocab differs (shouldn't happen here)
+        if len(tok) != student.get_input_embeddings().num_embeddings:
+            student.resize_token_embeddings(len(tok))
+
+        # -------------------------------------------------------------------
+        # 4) Dataset
+        # -------------------------------------------------------------------
+        print(f"[INFO] Loading dataset from {fold_dir}...")
+        ds = load_train_split(fold_dir, args.data_version)
+        n_rows = len(ds["train"])
+        print(f"[INFO] Train rows: {n_rows:,}")
+
+        train_tok = tokenize_dataset(ds, tok, max_len)
+
+        # -------------------------------------------------------------------
+        # 5) Training arguments
+        # -------------------------------------------------------------------
+        num_batches = math.ceil(n_rows / args.per_device_train_batch_size)
+        steps_per_epoch = max(1, math.ceil(num_batches / args.gradient_accumulation_steps))
+        frac = float(args.log_every_fraction)
+        logging_steps = max(1, int(round(steps_per_epoch * frac)))
+        print(f"[INFO] steps_per_epoch≈{steps_per_epoch}, logging_steps={logging_steps}")
+
+        tr_args = build_training_args(
+            out_dir=out_dir,
+            num_train_epochs=args.num_train_epochs,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            learning_rate=args.learning_rate,
+            save_steps=args.save_steps,
+            grad_accum=args.gradient_accumulation_steps,
+            logging_steps=logging_steps,
+        )
+
+        # -------------------------------------------------------------------
+        # 6) KD Trainer
+        # -------------------------------------------------------------------
+        cb = DinoStyleLogCallback(out_dir, plot_every_n_logs=args.plot_every_n_logs)
+
+        trainer_kwargs = dict(
+            model=student,
+            args=tr_args,
+            train_dataset=train_tok,
+            data_collator=DataCollatorWithPadding(tokenizer=tok),
+            callbacks=[cb],
+            teacher=teacher,
+            alpha=args.alpha,
+            temperature=args.temperature,
+        )
+
+        trainer_sig = inspect.signature(Trainer.__init__)
+        if "processing_class" in trainer_sig.parameters:
+            trainer_kwargs["processing_class"] = tok
+        elif "tokenizer" in trainer_sig.parameters:
+            trainer_kwargs["tokenizer"] = tok
+
+        trainer = KDTrainer(**trainer_kwargs)
+
+        # -------------------------------------------------------------------
+        # 7) Runtime tracking
+        # -------------------------------------------------------------------
+        runtime_json = os.path.join(out_dir, "train_runtime.json")
+        meta = {
+            "task": "KD_Cellular_NCLDV_Phage",
+            "version": args.data_version,
+            "teacher": args.teacher_model_path,
+            "student_tag": args.student_tag,
+            "size_tag": args.size_tag,
+            "fold": 1,
+            "alpha": args.alpha,
+            "temperature": args.temperature,
+        }
+        acc = RuntimeAccumulator(runtime_json, meta=meta)
+        acc.start()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        # -------------------------------------------------------------------
+        # 8) Train (with optional resume)
+        # -------------------------------------------------------------------
+        try:
+            last_ckpt = get_last_checkpoint(out_dir)
+        except Exception:
+            last_ckpt = None
+
+        if last_ckpt and os.path.isdir(last_ckpt):
+            print("=" * 70)
+            print(f"[RESUME] Found checkpoint: {last_ckpt}")
+            print("=" * 70)
+            trainer.train(resume_from_checkpoint=last_ckpt)
+        else:
+            print("[INFO] Starting fresh KD training")
+            trainer.train()
+
+        # -------------------------------------------------------------------
+        # 9) Save
+        # -------------------------------------------------------------------
+        # 9a) HF format (config + safetensors)
+        trainer.save_model(out_dir)
+        tok.save_pretrained(out_dir)
+        config.save_pretrained(out_dir)
+
+        # 9b) Raw PyTorch state dict (.pth)
+        pth_path = os.path.join(out_dir, "student_final.pth")
+        torch.save(student.state_dict(), pth_path)
+        print(f"[INFO] Saved student_final.pth -> {pth_path}")
+
+        # -------------------------------------------------------------------
+        # 10) Finalize runtime stats
+        # -------------------------------------------------------------------
+        stats = {}
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            stats["vram_peak_reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+            stats["vram_peak_allocated_bytes"] = int(torch.cuda.max_memory_allocated())
+
+        kb_per_row = 5000 if args.size_tag.lower() == "5kb" else 10000
+        acc.add_progress(rows_inc=n_rows, bp_inc=n_rows * kb_per_row)
+        acc.finish(stats)
+
+        print(f"[INFO] time_local_end: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+        print(f"[INFO] time_utc_end:   {datetime.datetime.utcnow():%Y-%m-%d %H:%M:%SZ}")
+        print(f"[INFO] Done. Output -> {out_dir}")
+        print(f"[INFO] Loss CSV: {os.path.join(out_dir, 'train_loss.csv')}")
+        print(f"[INFO] Loss PNG: {os.path.join(out_dir, 'train_loss.png')}")
+        print(f"[INFO] Runtime JSON: {runtime_json}")
+
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        raise
+    finally:
+        tee.close()
+
+
+if __name__ == "__main__":
+    main()

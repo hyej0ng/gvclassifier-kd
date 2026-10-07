@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "task": "KD_Cellular_NCLDV_Phage_feature_cosine",
+    "version": "v3",
+    "teacher": "/mnt/taskmaster1/scratch/hyejong/01_gv_genomeocean/finetuning_go_main/ft_models/train_v3_100M_5kb/fold1/checkpoint-326785",
+    "student_tag": "featcos6L",
+    "size_tag": "5kb",
+    "fold": 1,
+    "alpha": 0.5,
+    "teacher_num_hidden_layers": 12,
+    "student_num_hidden_layers": 6,
+    "teacher_layer_indices": [
+      0,
+      2,
+      4,
+      7,
+      9,
+      11
+    ],
+    "feature_loss": "masked_tokenwise_cosine"
+  },
+  "segments": [
+    {
+      "started_at": "2026-05-06T09:15:37Z",
+      "finished_at": "2026-05-08T14:47:30Z",
+      "seconds": 192713.19476914406,
+      "rows": 4182873,
+      "approx_bp": 20914365000,
+      "vram_peak_reserved_bytes": 8029995008,
+      "vram_peak_allocated_bytes": 4479064064
+    }
+  ],
+  "total_seconds": 192713.19476914406,
+  "train_rows": 4182873,
+  "approx_train_bp": 20914365000,
+  "sec_per_kb": 0.009214393780023637,
+  "vram_peak_reserved_bytes_max": 8029995008,
+  "vram_peak_allocated_bytes_max": 4479064064
+}

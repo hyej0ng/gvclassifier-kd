@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "task": "CE_Cellular_NCLDV_Phage",
+    "version": "v3",
+    "base_model": "/mnt/taskmaster1/scratch/hyejong/01_gv_genomeocean/finetuning_go_main/ft_models/train_v3_100M_5kb/fold1/checkpoint-326785",
+    "student_tag": "10M",
+    "size_tag": "5kb",
+    "fold": 1
+  },
+  "segments": [
+    {
+      "started_at": "2026-05-19T11:27:25Z",
+      "finished_at": "2026-05-20T00:22:44Z",
+      "seconds": 46519.56585884094,
+      "rows": 4182873,
+      "approx_bp": 20914365000,
+      "vram_peak_reserved_bytes": 975175680,
+      "vram_peak_allocated_bytes": 667824128
+    }
+  ],
+  "total_seconds": 46519.56585884094,
+  "train_rows": 4182873,
+  "approx_train_bp": 20914365000,
+  "sec_per_kb": 0.002224287749536787,
+  "vram_peak_reserved_bytes_max": 975175680,
+  "vram_peak_allocated_bytes_max": 667824128
+}

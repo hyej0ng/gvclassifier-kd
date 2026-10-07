@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "task": "KD_Cellular_NCLDV_Phage_layerdrop",
+    "version": "v3",
+    "teacher": "/mnt/taskmaster1/scratch/hyejong/01_gv_genomeocean/finetuning_go_main/ft_models/train_v3_100M_5kb/fold1/checkpoint-326785",
+    "student_tag": "layerdrop6L",
+    "size_tag": "5kb",
+    "fold": 1,
+    "alpha": 0.5,
+    "temperature": 4.0,
+    "teacher_num_hidden_layers": 12,
+    "student_num_hidden_layers": 6,
+    "teacher_layer_indices": [
+      0,
+      2,
+      4,
+      7,
+      9,
+      11
+    ]
+  },
+  "segments": [
+    {
+      "started_at": "2026-04-26T05:50:09Z",
+      "finished_at": "2026-04-28T03:31:07Z",
+      "seconds": 164457.93867182732,
+      "rows": 4182873,
+      "approx_bp": 20914365000,
+      "vram_peak_reserved_bytes": 8004829184,
+      "vram_peak_allocated_bytes": 4096133632
+    }
+  ],
+  "total_seconds": 164457.93867182732,
+  "train_rows": 4182873,
+  "approx_train_bp": 20914365000,
+  "sec_per_kb": 0.007863396219384491,
+  "vram_peak_reserved_bytes_max": 8004829184,
+  "vram_peak_allocated_bytes_max": 4096133632
+}

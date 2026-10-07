@@ -1,0 +1,17 @@
+{
+  "backend": "tokenizers",
+  "clean_up_tokenization_spaces": true,
+  "cls_token": "[CLS]",
+  "is_local": true,
+  "mask_token": "[MASK]",
+  "max_length": 1250,
+  "model_max_length": 1250,
+  "pad_token": "[PAD]",
+  "padding_side": "right",
+  "sep_token": "[SEP]",
+  "stride": 0,
+  "tokenizer_class": "TokenizersBackend",
+  "truncation_side": "right",
+  "truncation_strategy": "longest_first",
+  "unk_token": "[UNK]"
+}

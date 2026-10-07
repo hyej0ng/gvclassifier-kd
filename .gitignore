@@ -1,0 +1,20 @@
+# Model weights
+*.safetensors
+*.pth
+pytorch_model*.bin
+
+# Training checkpoints and serialized state
+checkpoint-*/
+training_args.bin
+optimizer.pt
+scheduler.pt
+rng_state*.pth
+
+# Execution logs (keep train_loss.csv/png and train_runtime.json)
+log/
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
