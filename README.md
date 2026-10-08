@@ -1,4 +1,4 @@
-# gvclassifier-kd
+# GenomeOcean Classifier Distillation and Compression
 
 Compression experiments for the GenomeOcean-based DNA sequence classifier. A fine-tuned 100M Mistral sequence classifier serves as the teacher for smaller students that predict **Cellular**, **NCLDV**, or **Phage**. This directory contains saved fold 1 models and training artifacts for the v3, 5 kb experiments.
 
